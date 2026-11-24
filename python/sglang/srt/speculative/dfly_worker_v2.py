@@ -8,20 +8,18 @@ from sglang.kernels.ops.speculative.dflash import (
 )
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.layers.dp_attention import get_dp_tp_group
-from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_exec, get_schedule, get_spec
-from sglang.srt.sampling.verify_accept import VerifyAccept, commit_verify_accept
+from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
-    apply_dflash_verify_logits_adjustments,
     commit_accept,
     compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
@@ -29,6 +27,7 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.speculative.dfly_utils import DFlyRequestState
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
+from sglang.srt.speculative.target_verify import TargetVerify, adjust_verify_logits
 
 
 class DFlyWorkerV2(BaseSpecWorker):
@@ -195,23 +194,27 @@ class DFlyWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         candidates = self.dfly.candidates_out[: bs * width].view(bs, width)
+        # DFly rejects constrained decoding at admission; like DFlash, it binds no watermark.
+        verify = TargetVerify.prepare(
+            batch,
+            logits_output=logits_output,
+            grammar_tree=None,
+            grammar_barrier=None,
+            watermark_engine=None,
+            watermark_full_mask=False,
+        )
         num_correct_drafts, bonus = self._accept(
             batch, draft_input, candidates, logits_output.next_token_logits
         )
         out_tokens, commit_lens = commit_accept(candidates, num_correct_drafts, bonus)
-        if batch.sampling_info is not None:
-            commit_verify_accept(
-                batch.sampling_info,
-                VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
-                watermark=None,
-            )
+        verify.commit(
+            batch,
+            logits_output=logits_output,
+            accept=VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
+        )
         new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
             on_publish(new_seq_lens)
-        if batch.return_logprob:
-            compute_spec_logprobs(
-                batch, logits_output, out_tokens.reshape(-1), chain_stride=width
-            )
         source_rows = torch.arange(bs, device=self.device) * width + num_correct_drafts
         self._commit_state(batch, logits_output.hidden_states, source_rows)
         logits_output.hidden_states = None
@@ -275,11 +278,12 @@ class DFlyWorkerV2(BaseSpecWorker):
     def _accept(self, batch, draft_input, candidates, next_token_logits):
         sampling_info = batch.sampling_info
         if sampling_info is not None:
-            apply_dflash_verify_logits_adjustments(
-                next_token_logits=next_token_logits,
+            adjust_verify_logits(
+                next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=self.block_size,
-                verify_tokens=candidates,
+                grammar_mask=None,
+                draft_tokens=candidates,
+                has_custom_logit_processor=sampling_info.has_custom_logit_processor,
             )
         if (
             sampling_info is not None
