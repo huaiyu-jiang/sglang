@@ -43,7 +43,6 @@ from sglang.srt.configs.hy_v4_flash import (
     HYV4FlashTextConfig,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.engram import EngramHasher
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -1138,7 +1137,6 @@ class HYV4FlashMoE(nn.Module):
             and self.gate.weight.dtype == torch.bfloat16
             and self.routed_latent_down.weight.dtype == torch.bfloat16
             and current_arch().is_sm(9)
-            and envs.SGLANG_OPT_HY4_FLASH_STACKED_MOE_DENSE.get()
             # The stacked kernels pick their schedule by token count.
             and not get_exec().deterministic.enable_deterministic_inference
         )
