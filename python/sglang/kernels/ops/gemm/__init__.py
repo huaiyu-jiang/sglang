@@ -424,6 +424,16 @@ register_kernel(
         capabilities=_SM90 | _SM10X,
     )
 )
+# Each dispatches to the warp split-K GEMM (M <= 32) or its own Triton kernel.
+for _name in ("hy4_moe_dense_front", "hy4_moe_dense_back"):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_name}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.gemm.hy4_flash_moe_dense:{_name}",
+            capabilities=_SM90,
+        )
+    )
 register_kernel(
     KernelSpec(
         op="gemm.hopper_bf16_gemv",

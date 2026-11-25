@@ -2647,6 +2647,14 @@ class Envs:
     SGLANG_OPT_ERNIE5_5_FUSE_INEXACT = EnvBool(True)
 
     # ===================================================================
+    # Hy4-Flash
+    # ===================================================================
+    # SM90: stack the MoE block's five BF16 dense projections into two weights
+    # and run them as two skinny GEMMs in captured decode graphs (M <= 128).
+    # See kernels/ops/gemm/hy4_flash_moe_dense.py.
+    SGLANG_OPT_HY4_FLASH_STACKED_MOE_DENSE = EnvBool(True)
+
+    # ===================================================================
     # Symmetric memory
     # ===================================================================
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)

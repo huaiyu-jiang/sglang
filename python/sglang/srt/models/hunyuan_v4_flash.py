@@ -21,10 +21,16 @@ import torch.nn.functional as F
 import triton
 from torch import nn
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.dsa import hy4_flash_indexpool as indexpool_kernels
 from sglang.kernels.ops.embeddings.hy4_flash_engram import (
     hy4_flash_engram_combine,
     hy4_flash_engram_lookup,
+)
+from sglang.kernels.ops.gemm.hy4_flash_moe_dense import (
+    hy4_moe_dense_back,
+    hy4_moe_dense_front,
+    stack_hy4_moe_dense_weights,
 )
 from sglang.kernels.ops.layernorm.hy4_ihc import (
     fused_hy4_ihc_post,
@@ -37,6 +43,7 @@ from sglang.srt.configs.hy_v4_flash import (
     HYV4FlashTextConfig,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.engram import EngramHasher
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -67,6 +74,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
@@ -78,7 +86,7 @@ from sglang.srt.models.hunyuan_v4 import (
 )
 from sglang.srt.models.hunyuan_v4_vl import HYV4VisionTransformer
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import BumpAllocator
 
 logger = logging.getLogger(__name__)
@@ -1125,14 +1133,86 @@ class HYV4FlashMoE(nn.Module):
             if config.sandwich_norm
             else None
         )
+        self.use_stacked_dense = (
+            self.routed_latent_down is not None
+            and self.gate.weight.dtype == torch.bfloat16
+            and self.routed_latent_down.weight.dtype == torch.bfloat16
+            and current_arch().is_sm(9)
+            and envs.SGLANG_OPT_HY4_FLASH_STACKED_MOE_DENSE.get()
+            # The stacked kernels pick their schedule by token count.
+            and not get_exec().deterministic.enable_deterministic_inference
+        )
+        self.stacked_dense = None
 
     @property
     def out_norm(self):
         return self.combine_output_norm
 
+    def _dense_params(self) -> tuple[nn.Parameter, ...]:
+        return (
+            self.routed_latent_down.weight,
+            self.shared_experts.gate_up_proj.weight,
+            self.gate.weight,
+            self.routed_latent_up.weight,
+            self.shared_experts.down_proj.weight,
+        )
+
+    def stack_dense_weights(self):
+        """Move the five dense weights into the stacked front/back weights and
+        point the parameters at views of them, so weight loads keep updating them."""
+        params = self._dense_params()
+        if self.stacked_dense is None:
+            latent_down, gate_up, router, latent_up, shared_down = (
+                p.data for p in params
+            )
+            self.stacked_dense = stack_hy4_moe_dense_weights(
+                latent_down=latent_down,
+                shared_gate_up=gate_up,
+                router=router,
+                latent_up=latent_up,
+                shared_down=shared_down,
+            )
+        else:
+            # A parameter a loader replaced is copied in, never re-stacked:
+            # captured CUDA graphs hold the stacked tensors' addresses.
+            for param, view in zip(params, self._stacked_views()):
+                if param.data_ptr() != view.data_ptr():
+                    view.copy_(param.data)
+        for param, view in zip(params, self._stacked_views()):
+            param.data = view
+
+    def _stacked_views(self) -> tuple[torch.Tensor, ...]:
+        return self.stacked_dense.front_views() + self.stacked_dense.back_views()
+
+    def _forward_stacked_dense(self, hidden_states):
+        """The five dense projections from the stacked weights: two skinny GEMMs
+        in captured graphs, the module calls and one back GEMM elsewhere."""
+        stacked = self.stacked_dense
+        capturing = get_is_capture_mode()
+        x = hidden_states.contiguous()
+        front = hy4_moe_dense_front(stacked, x) if capturing else None
+        if front is None:
+            lat = self.routed_latent_down(x)[0]
+            gu = self.shared_experts.gate_up_proj(x)[0]
+            front = lat, gu, self.gate(x)
+        lat, gu, router_logits = front
+        topk_output = self.topk(hidden_states, router_logits)
+        routed = self.experts(lat, topk_output).contiguous()
+        act = self.shared_experts.act_fn(gu).contiguous()
+        out = hy4_moe_dense_back(stacked, routed, act) if capturing else None
+        if out is None:
+            # One GEMM on [routed | act] replaces two GEMMs and an add.
+            out = F.linear(torch.cat([routed, act], dim=1), stacked.back)
+        return out
+
     def forward(self, hidden_states, forward_batch=None, apply_out_norm=True):
         if hidden_states.shape[0] == 0:
             return hidden_states
+        if self.stacked_dense is not None:
+            out = _maybe_all_reduce(self._forward_stacked_dense(hidden_states))
+            if apply_out_norm and self.combine_output_norm is not None:
+                out = self.combine_output_norm(out)
+            return out
         router_logits = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         routed_input = hidden_states
@@ -1502,6 +1582,12 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
             self.visual.load_weights(vision_weights)
         if model.engram_hasher is not None and not model.engram_hasher._loaded:
             raise ValueError("Hy4-Flash checkpoint is missing the Engram lookup_table")
+
+    def post_load_weights(self, is_nextn=False, weight_names=None):
+        super().post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        for module in self.model.modules():
+            if isinstance(module, HYV4FlashMoE) and module.use_stacked_dense:
+                module.stack_dense_weights()
 
     def _load_engram(self, name: str, value: torch.Tensor):
         prefix, leaf = name.split(".engram_layer.", 1)
