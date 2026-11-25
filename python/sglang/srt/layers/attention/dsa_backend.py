@@ -593,6 +593,54 @@ def _small_heads_prefill_enabled(
     )
 
 
+def _sm90_prefill_token_packing_enabled(*, device_sm_major, deterministic) -> bool:
+    # Token packing makes a token's output depend on its tile neighbours.
+    return _is_cuda and device_sm_major == 9 and not deterministic
+
+
+def _forward_flashmla_sparse_token_packed(
+    *,
+    q_all,
+    kv_cache,
+    page_table_1,
+    v_head_dim,
+    sm_scale,
+    attn_sink,
+    topk_length,
+    packed_variants: set,
+) -> Optional[torch.Tensor]:
+    """SM90 token-packed sparse prefill, or None to run the padded call."""
+    from sglang.kernels.ops.attention.dsa.flashmla_sparse_token_pack_sm90 import (
+        MIN_PROFITABLE_TOKENS,
+        flashmla_sparse_fwd_token_packed,
+        token_pack_supported,
+    )
+
+    variant = (page_table_1.shape[-1], attn_sink is not None)
+    # The first call per kernel variant packs even when short, so the startup
+    # warmup request compiles the Triton kernels.
+    if q_all.shape[0] < MIN_PROFITABLE_TOKENS and variant in packed_variants:
+        return None
+    if not token_pack_supported(
+        q=q_all,
+        kv=kv_cache,
+        indices=page_table_1,
+        d_v=v_head_dim,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+    ):
+        return None
+    packed_variants.add(variant)
+    return flashmla_sparse_fwd_token_packed(
+        q=q_all,
+        kv=kv_cache,
+        indices=page_table_1,
+        sm_scale=sm_scale,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+    )
+
+
 def _validate_flashmla_sparse_q8_backend(
     *,
     prefill_impl: str,
@@ -1054,6 +1102,12 @@ class DeepseekSparseAttnBackend(
             self.qk_rope_head_dim,
             self.dsa_prefill_impl,
         )
+        self.flashmla_sparse_token_packing = _sm90_prefill_token_packing_enabled(
+            device_sm_major=self.device_sm_major,
+            deterministic=get_exec().deterministic.enable_deterministic_inference,
+        )
+        # (index width, has sink) variants the packed prefill has compiled.
+        self._token_pack_variants: set = set()
         # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.
         _validate_flashmla_sparse_q8_backend(
             prefill_impl=self.dsa_prefill_impl,
@@ -3005,6 +3059,7 @@ class DeepseekSparseAttnBackend(
                 topk_length=metadata.dsa_cache_seqlens_int32,
                 attn_sink=attn_sink,
                 allow_small_heads=True,
+                allow_token_packing=forward_batch.forward_mode.is_extend_without_speculative(),
             )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_rope is not None:
@@ -3396,11 +3451,45 @@ class DeepseekSparseAttnBackend(
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
         allow_small_heads: bool = False,
+        allow_token_packing: bool = False,
     ) -> torch.Tensor:
         # FlashMLA sparse kernels are instantiated at 64 heads (Hopper and
         # Blackwell) and 128 heads (Blackwell); with TP the local head count may
         # be smaller (e.g., 64 // 4 = 16) and is padded up.
         num_tokens, num_heads, head_dim = q_all.shape
+
+        # topk_length is the per-row count of valid indices
+        # (`dsa_cache_seqlens_int32` = seqlens clipped to `index_topk`). Rows
+        # whose context is shorter than `index_topk` have their indices
+        # tail-padded with -1; passing the valid length lets the kernel skip
+        # the padded tail instead of scanning the full topk width. The output
+        # is unchanged: the kernel masks -1 indices either way.
+        if topk_length is not None and topk_length.shape[0] != num_tokens:
+            # Metadata rows are expected to match q rows (the DP/CP padding
+            # helpers keep them aligned); fall back to full-width compute if
+            # they ever diverge.
+            topk_length = None
+        if (
+            topk_length is not None
+            and self.dsa_index_topk is not None
+            and page_table_1.shape[-1] < self.dsa_index_topk
+        ):
+            topk_length = topk_length.clamp(max=page_table_1.shape[-1])
+
+        if allow_token_packing and self.flashmla_sparse_token_packing:
+            o = _forward_flashmla_sparse_token_packed(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                v_head_dim=v_head_dim,
+                sm_scale=sm_scale,
+                attn_sink=attn_sink,
+                topk_length=topk_length,
+                packed_variants=self._token_pack_variants,
+            )
+            if o is not None:
+                return o
+
         use_small_heads = (
             allow_small_heads
             and self.sparse_prefill_small_heads
@@ -3444,24 +3533,6 @@ class DeepseekSparseAttnBackend(
 
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
-
-        # topk_length is the per-row count of valid indices
-        # (`dsa_cache_seqlens_int32` = seqlens clipped to `index_topk`). Rows
-        # whose context is shorter than `index_topk` have their indices
-        # tail-padded with -1; passing the valid length lets the kernel skip
-        # the padded tail instead of scanning the full topk width. The output
-        # is unchanged: the kernel masks -1 indices either way.
-        if topk_length is not None and topk_length.shape[0] != num_tokens:
-            # Metadata rows are expected to match q rows (the DP/CP padding
-            # helpers keep them aligned); fall back to full-width compute if
-            # they ever diverge.
-            topk_length = None
-        if (
-            topk_length is not None
-            and self.dsa_index_topk is not None
-            and page_table_1.shape[-1] < self.dsa_index_topk
-        ):
-            topk_length = topk_length.clamp(max=page_table_1.shape[-1])
 
         if use_small_heads:
             o, _, _ = self._call_flash_mla_sparse_fwd_small_heads(

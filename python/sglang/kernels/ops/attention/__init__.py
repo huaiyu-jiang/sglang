@@ -338,6 +338,16 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="attention.flashmla_sparse_fwd_token_packed",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.flashmla_sparse_token_pack_sm90:flashmla_sparse_fwd_token_packed",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.flashmla_token_pack_prepare",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsa.flashmla_token_pack:flashmla_token_pack_prepare",
