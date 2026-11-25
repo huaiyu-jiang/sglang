@@ -415,6 +415,17 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.warp_splitk_dense_multi_io",
+        backend=KernelBackend.CUTE_DSL,
+        target=(
+            "sglang.kernels.ops.gemm.dense_bf16_gemm_warp_splitk"
+            ":run_warp_splitk_dense_multi_io"
+        ),
+        capabilities=_SM90 | _SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.hopper_bf16_gemv",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.hopper_bf16_gemv:hopper_bf16_gemv",
